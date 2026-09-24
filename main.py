@@ -1,601 +1,434 @@
 import os
+import io
+import time
+import base64
 import logging
+import sqlite3
+import threading
+
 import telebot
 from telebot import types
+from openai import OpenAI
+
 
 # =========================================================
-# USTADRIVE
+# USTADRIVE CONFIG
 # =========================================================
 
-TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_ID = os.environ.get("ADMIN_ID", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()
 
 CHANNEL_1 = "@ustadriveuz"
 CHANNEL_2 = "@UstaDriveMarket"
 
-BOT_NAME = "UstaDrive"
+CHANNEL_1_URL = "https://t.me/ustadriveuz"
+CHANNEL_2_URL = "https://t.me/UstaDriveMarket"
 
-if not TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN topilmadi! Render Environment Variables ichiga BOT_TOKEN qo‘shing."
-    )
+BOT_NAME = "UstaDrive"
+DB_FILE = "ustadrive.db"
+
+AI_MODEL = os.environ.get("AI_MODEL", "gpt-5.6-luna")
+
+
+# =========================================================
+# TEKSHIRUV
+# =========================================================
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN Environment Variable topilmadi.")
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY Environment Variable topilmadi.")
+
+
+# =========================================================
+# LOG
+# =========================================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
+
+# =========================================================
+# CLIENTLAR
+# =========================================================
+
+bot = telebot.TeleBot(
+    BOT_TOKEN,
+    parse_mode="HTML"
+)
+
+ai = OpenAI(
+    api_key=OPENAI_API_KEY
+)
 
 
 # =========================================================
-# ASOSIY MENU
+# DATABASE
 # =========================================================
 
-def main_menu():
-    markup = types.ReplyKeyboardMarkup(
-        resize_keyboard=True,
-        row_width=2
+db_lock = threading.Lock()
+
+
+def db():
+    return sqlite3.connect(
+        DB_FILE,
+        check_same_thread=False
     )
 
-    markup.add(
-        types.KeyboardButton("🔧 Avto yordam"),
-        types.KeyboardButton("🚨 Tez yordam"),
-    )
 
-    markup.add(
-        types.KeyboardButton("📚 Maslahatlar"),
-        types.KeyboardButton("ℹ️ Yordam"),
-    )
+def init_db():
 
-    return markup
+    with db_lock:
+
+        conn = db()
+        cur = conn.cursor()
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                joined_at INTEGER,
+                messages INTEGER DEFAULT 0
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+
+        conn.commit()
+        conn.close()
+
+
+init_db()
 
 
 # =========================================================
-# OBUNA TEKSHIRISH
+# USER SAQLASH
+# =========================================================
+
+def save_user(user):
+
+    with db_lock:
+
+        conn = db()
+        cur = conn.cursor()
+
+        cur.execute("""
+            INSERT OR IGNORE INTO users
+            (user_id, username, first_name, joined_at, messages)
+            VALUES (?, ?, ?, ?, 0)
+        """, (
+            user.id,
+            user.username or "",
+            user.first_name or "",
+            int(time.time())
+        ))
+
+        cur.execute("""
+            UPDATE users
+            SET username = ?, first_name = ?
+            WHERE user_id = ?
+        """, (
+            user.username or "",
+            user.first_name or "",
+            user.id
+        ))
+
+        conn.commit()
+        conn.close()
+
+
+def add_message(user_id):
+
+    with db_lock:
+
+        conn = db()
+        cur = conn.cursor()
+
+        cur.execute("""
+            UPDATE users
+            SET messages = messages + 1
+            WHERE user_id = ?
+        """, (user_id,))
+
+        conn.commit()
+        conn.close()
+
+
+# =========================================================
+# STATISTIKA
+# =========================================================
+
+def get_stats():
+
+    with db_lock:
+
+        conn = db()
+        cur = conn.cursor()
+
+        cur.execute("SELECT COUNT(*) FROM users")
+        users = cur.fetchone()[0]
+
+        cur.execute("SELECT COALESCE(SUM(messages), 0) FROM users")
+        messages = cur.fetchone()[0]
+
+        conn.close()
+
+    return users, messages
+
+
+# =========================================================
+# OBUNA
 # =========================================================
 
 def is_subscribed(user_id):
-    channels = [CHANNEL_1, CHANNEL_2]
 
-    for channel in channels:
+    for channel in [CHANNEL_1, CHANNEL_2]:
+
         try:
-            member = bot.get_chat_member(channel, user_id)
 
-            if member.status in ["left", "kicked"]:
+            member = bot.get_chat_member(
+                channel,
+                user_id
+            )
+
+            if member.status in [
+                "left",
+                "kicked"
+            ]:
                 return False
 
         except Exception as e:
+
             logging.error(
-                f"Obuna tekshirishda xato: {channel} -> {e}"
+                "Kanal tekshirish xatosi %s: %s",
+                channel,
+                e
             )
+
             return False
 
     return True
 
 
 def subscription_keyboard():
-    markup = types.InlineKeyboardMarkup(row_width=1)
+
+    markup = types.InlineKeyboardMarkup(
+        row_width=1
+    )
 
     markup.add(
         types.InlineKeyboardButton(
-            "📢 UstaDriveUZ kanaliga qo‘shilish",
-            url="https://t.me/ustadriveuz"
+            "📢 UstaDriveUZ",
+            url=CHANNEL_1_URL
         )
     )
 
     markup.add(
         types.InlineKeyboardButton(
-            "🛒 UstaDriveMarket kanaliga qo‘shilish",
-            url="https://t.me/UstaDriveMarket"
+            "🛒 UstaDriveMarket",
+            url=CHANNEL_2_URL
         )
     )
 
     markup.add(
         types.InlineKeyboardButton(
             "✅ Obunani tekshirish",
-            callback_data="check_subscription"
+            callback_data="check_sub"
         )
     )
 
     return markup
 
 
-def send_subscription_message(chat_id):
-    bot.send_message(
-        chat_id,
-        """
-<b>🔐 UstaDrive'ga xush kelibsiz!</b>
+def require_subscription(message):
 
-Botdan foydalanish uchun avval quyidagi <b>2 ta kanalga</b> qo‘shiling:
+    if is_subscribed(message.from_user.id):
+        return True
+
+    bot.send_message(
+        message.chat.id,
+        """
+<b>🔐 UstaDrive</b>
+
+Botdan foydalanish uchun avval ikkala kanalga ham qo‘shiling:
 
 📢 <b>UstaDriveUZ</b>
 🛒 <b>UstaDriveMarket</b>
 
-Kanalga qo‘shilgandan keyin:
-
-<b>✅ Obunani tekshirish</b>
-
-tugmasini bosing.
+Keyin <b>✅ Obunani tekshirish</b> tugmasini bosing.
 """,
         reply_markup=subscription_keyboard()
     )
 
-
-def require_subscription(message):
-    if is_subscribed(message.from_user.id):
-        return True
-
-    send_subscription_message(message.chat.id)
     return False
 
 
 # =========================================================
-# AVTOMOBIL MASLAHAT TIZIMI
+# MENU
 # =========================================================
 
-def car_advice(text):
+def main_menu():
 
-    t = text.lower().strip()
+    markup = types.ReplyKeyboardMarkup(
+        resize_keyboard=True
+    )
 
-    # -----------------------------------------------------
-    # SALOMLASHISH
-    # -----------------------------------------------------
+    markup.row(
+        "🤖 AI Usta",
+        "🚨 Tez yordam"
+    )
 
-    if any(word in t for word in [
-        "salom",
-        "assalom",
-        "assalomu",
-        "hello",
-        "hi"
-    ]):
-        return """
-<b>👋 Assalomu alaykum!</b>
+    markup.row(
+        "📚 Avto maslahat",
+        "📊 Statistika"
+    )
 
-Men <b>UstaDrive</b> — avtomobil muammolarini tushuntirishga yordam beradigan botman. 🚗🔧
+    markup.row(
+        "ℹ️ Yordam"
+    )
 
-Muammoni oddiy qilib yozing.
+    return markup
 
-Masalan:
 
-🛞 Cobalt baloni teshilib qoldi
-🔋 Akkumulyator o‘tirib qoldi
-🚗 Mashina o‘t olmayapti
-🌡 Cobalt qizib ketyapti
-🚨 Check Engine yonib qoldi
-🛑 Tormoz yaxshi ishlamayapti
+# =========================================================
+# AI USTA
+# =========================================================
+
+SYSTEM_PROMPT = """
+Sen UstaDrive nomli avtomobil yordamchi botisan.
+
+Foydalanuvchi bilan o'zbek tilida, sodda va tushunarli gaplash.
+
+Sening vazifang:
+- avtomobil nosozligini tushunish;
+- ehtimoliy sabablarni aytish;
+- xavfsiz tekshiruvlarni tushuntirish;
+- kerak bo'lsa ustaga murojaat qilishni tavsiya qilish;
+- avtomobil rusumi va simptomlar asosida savollar berish;
+- Cobalt, Nexia, Gentra, Lacetti va boshqa avtomobillar bo'yicha umumiy texnik maslahat berish.
+
+Muhim:
+- Aniq ko'rmasdan nosoz detalni 100% deb aytma.
+- "Ehtimol", "bo'lishi mumkin" kabi iboralardan foydalan.
+- Tormoz, rul, yoqilg'i sizishi, qizib ketish, elektr qisqa tutashuvi kabi xavfli holatlarda xavfsizlikni birinchi o'ringa qo'y.
+- Qizigan radiator qopqog'ini ochishni tavsiya qilma.
+- Foydalanuvchini xavfli ta'mirlashni o'zi bajarishga undama.
+- Agar mashinani haydash xavfli bo'lsa, haydamaslikni va malakali ustaga murojaat qilishni ayt.
+- Javobni imkon qadar amaliy va bosqichma-bosqich ber.
+- Keraksiz uzun javob bermagin.
+- Tibbiy, siyosiy yoki boshqa mavzularga o'tib ketma; avtomobil masalasida yordam ber.
+
+Javob formati:
+🔧 Muammo
+🔎 Ehtimoliy sabablar
+✅ Nima qilish mumkin
+⚠️ Qachon haydamaslik kerak
+
+Agar ma'lumot yetarli bo'lmasa, avtomobil rusumi, yili, dvigateli va simptom haqida qisqa savollar ber.
 """
 
 
-    # -----------------------------------------------------
-    # BALON / SHINA
-    # -----------------------------------------------------
+def ask_ai(text):
 
-    if any(word in t for word in [
-        "balon",
-        "shina",
-        "g'ildirak",
-        "gildirak",
-        "teshildi",
-        "teshib",
-        "teshik",
-        "baloni"
-    ]):
+    try:
+
+        response = ai.responses.create(
+            model=AI_MODEL,
+            instructions=SYSTEM_PROMPT,
+            input=text
+        )
+
+        answer = response.output_text.strip()
+
+        if not answer:
+            return "❌ AI javob qaytara olmadi. Birozdan keyin qayta urinib ko‘ring."
+
+        return answer
+
+    except Exception as e:
+
+        logging.exception("AI xatosi")
 
         return """
-<b>🛞 BALON / SHINA MUAMMOSI</b>
+❌ Hozir AI xizmatida vaqtinchalik muammo yuz berdi.
 
-Agar shina teshilgan bo‘lsa:
-
-1️⃣ Mashinani xavfsiz joyga sekin to‘xtating.
-2️⃣ Avariya chirog‘ini yoqing.
-3️⃣ Shina juda bo‘shagan bo‘lsa, haydashni davom ettirmang.
-4️⃣ Zapas balon bo‘lsa, uni qo‘yish mumkin.
-5️⃣ Domkratni faqat tekis va mustahkam joyda ishlating.
-
-Agar shina yon tomondan jiddiy shikastlangan bo‘lsa, ta’mirlashga urinmasdan vulkanizatsiyaga murojaat qilish kerak.
-
-⚠️ Mashina ostiga faqat domkratga tayanib kirmang.
+Iltimos, birozdan keyin qayta urinib ko‘ring.
 """
 
 
-    # -----------------------------------------------------
-    # AKKUMULYATOR
-    # -----------------------------------------------------
+# =========================================================
+# AI RASM TAHLILI
+# =========================================================
 
-    if any(word in t for word in [
-        "akkumulyator",
-        "akumulyator",
-        "akum",
-        "akkum",
-        "batareya",
-        "tok yo'q",
-        "tok yoq"
-    ]):
+def ask_ai_image(image_bytes, user_text):
 
-        return """
-<b>🔋 AKKUMULYATOR MUAMMOSI</b>
+    try:
 
-Agar mashina starter aylantirmayotgan bo‘lsa:
+        encoded = base64.b64encode(
+            image_bytes
+        ).decode("utf-8")
 
-• Faralar juda xira bo‘lsa — akkumulyator zaryadi past bo‘lishi mumkin.
-• Klemalar bo‘sh yoki oksidlangan bo‘lishi mumkin.
-• Akkumulyator kuchsiz bo‘lsa, tok berish kerak bo‘lishi mumkin.
-• Starter faqat “chert” etsa — akkumulyator yoki starter tizimini tekshirish kerak.
+        prompt = user_text.strip()
 
-⚠️ Boshqa mashinadan tok berishda + va − qutblarni adashtirmang.
+        if not prompt:
+            prompt = """
+Bu avtomobilga tegishli rasm.
+
+Rasmda ko'rinayotgan narsani tahlil qil.
+Agar paneldagi ogohlantirish belgisi bo'lsa, uning ma'nosini tushuntir.
+Agar detal yoki nosozlik ko'rinsa, faqat ko'rinadigan dalillarga asoslan.
+Aniq bo'lmasa, taxmin ekanini ayt.
+Xavfli holat bo'lsa, xavfsizlik choralarini birinchi ayt.
+Javobni o'zbek tilida ber.
 """
 
+        response = ai.responses.create(
+            model=AI_MODEL,
+            instructions=SYSTEM_PROMPT,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": prompt
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": (
+                                "data:image/jpeg;base64,"
+                                + encoded
+                            )
+                        }
+                    ]
+                }
+            ]
+        )
 
-    # -----------------------------------------------------
-    # MASHINA O'T OLMAYAPTI
-    # -----------------------------------------------------
+        answer = response.output_text.strip()
 
-    if any(word in t for word in [
-        "o't olmay",
-        "ot olmay",
-        "ot olmayapti",
-        "o't olmayapti",
-        "ishga tushmay",
-        "ishga tushmayapti",
-        "start olmay",
-        "yurmayapti",
-        "yurmayabdi"
-    ]):
+        return answer or "❌ Rasmni tahlil qilib bo‘lmadi."
 
-        return """
-<b>🚗 MASHINA O‘T OLMAYAPTI</b>
+    except Exception:
 
-Avval quyidagilarni aniqlang:
-
-1️⃣ Starter aylanadimi?
-2️⃣ Panel chiroqlari yonadimi?
-3️⃣ Yoqilg‘i bormi?
-4️⃣ Starter aylanganda noodatiy ovoz bormi?
-5️⃣ Panelda Check Engine yoki boshqa belgi bormi?
-
-🔋 Starter umuman aylanmasa — akkumulyator, klemma yoki starter tizimi sabab bo‘lishi mumkin.
-
-⚙️ Starter aylansa-yu, motor ishga tushmasa — yoqilg‘i, uchqun yoki dvigatel boshqaruv tizimini tekshirtirish kerak bo‘lishi mumkin.
-"""
-
-
-    # -----------------------------------------------------
-    # QIZIB KETISH
-    # -----------------------------------------------------
-
-    if any(word in t for word in [
-        "qizib",
-        "qiziyapti",
-        "qizib ket",
-        "temperatura",
-        "harorat",
-        "bug'",
-        "bug‘",
-        "bug chiq",
-        "radiator"
-    ]):
+        logging.exception(
+            "Rasm AI xatosi"
+        )
 
         return """
-<b>🌡 DVIGATEL QIZIB KETMOQDA</b>
+❌ Rasmni hozir tahlil qilib bo‘lmadi.
 
-Agar harorat juda ko‘tarilgan yoki kapot ostidan bug‘ chiqayotgan bo‘lsa:
-
-1️⃣ Xavfsiz joyga to‘xtang.
-2️⃣ Dvigatelni zo‘riqtirmang.
-3️⃣ Qizigan radiator qopqog‘ini darhol ochmang.
-4️⃣ Dvigatel sovishini kuting.
-5️⃣ Sovigandan keyin sovutish suyuqligi kamaygan-kamaymaganini tekshirish mumkin.
-
-Agar suyuqlik oqayotgan bo‘lsa yoki mashina yana tez qizisa, haydashni davom ettirmang.
-
-🔧 Ustaga ko‘rsatish kerak.
-"""
-
-
-    # -----------------------------------------------------
-    # CHECK ENGINE
-    # -----------------------------------------------------
-
-    if any(word in t for word in [
-        "check",
-        "check engine",
-        "checkengine",
-        "motor chirog'i",
-        "motor chirogi",
-        "dvigatel chirog'i",
-        "dvigatel chirogi"
-    ]):
-
-        return """
-<b>🚨 CHECK ENGINE</b>
-
-Check Engine yonishi dvigatel yoki uning boshqaruv tizimida xatolik borligini bildirishi mumkin.
-
-🔎 Aniq sababni bilish uchun OBD diagnostika kerak bo‘lishi mumkin.
-
-Agar Check Engine <b>miltillayotgan</b> bo‘lsa yoki mashina kuchli titrasa, haydashni davom ettirmaslik xavfsizroq.
-
-🔧 Diagnostika qildirish tavsiya etiladi.
-"""
-
-
-    # -----------------------------------------------------
-    # MOY
-    # -----------------------------------------------------
-
-    if any(word in t for word in [
-        "moy",
-        "maslo",
-        "yog'",
-        "yog‘",
-        "motor moyi"
-    ]):
-
-        return """
-<b>🛢 DVIGATEL MOYI</b>
-
-Moyni tekshirish:
-
-1️⃣ Mashinani tekis joyga qo‘ying.
-2️⃣ Dvigatelni o‘chiring.
-3️⃣ Biroz kuting.
-4️⃣ Shchup orqali moy darajasini tekshiring.
-5️⃣ Daraja MIN dan past bo‘lsa, mos moy masalasini hal qilish kerak.
-
-⚠️ Agar moy bosimi chirog‘i yonib turgan bo‘lsa, mashinani haydashda davom etmang.
-"""
-
-
-    # -----------------------------------------------------
-    # TORMOZ
-    # -----------------------------------------------------
-
-    if any(word in t for word in [
-        "tormoz",
-        "kolodka",
-        "tormozlamay",
-        "tormoz ishlamay",
-        "tormoz ishlamayapti"
-    ]):
-
-        return """
-<b>🛑 TORMOZ MUAMMOSI</b>
-
-Agar:
-
-• pedal juda yumshoq bo‘lsa;
-• pedal juda past tushsa;
-• tormozlash keskin yomonlashgan bo‘lsa;
-• tormoz suyuqligi sizayotgan bo‘lsa;
-
-⚠️ Mashinani haydashni davom ettirmang.
-
-Tormoz tizimi xavfsizlik uchun juda muhim.
-
-🔧 Usta tomonidan tekshirtirish kerak.
-"""
-
-
-    # -----------------------------------------------------
-    # STARTER
-    # -----------------------------------------------------
-
-    if any(word in t for word in [
-        "starter",
-        "startyor",
-        "start",
-        "chert",
-        "klik",
-        "starter aylanmay"
-    ]):
-
-        return """
-<b>🔑 STARTER MUAMMOSI</b>
-
-Kalitni buraganda faqat “chert” etsa:
-
-🔋 Akkumulyator kuchsiz bo‘lishi mumkin.
-🔩 Klemalar bo‘sh yoki oksidlangan bo‘lishi mumkin.
-⚙️ Starter yoki rele tizimida muammo bo‘lishi mumkin.
-
-Akkumulyator yaxshi bo‘lsa-yu starter ishlamasa, diagnostika kerak.
-"""
-
-
-    # -----------------------------------------------------
-    # ELEKTR
-    # -----------------------------------------------------
-
-    if any(word in t for word in [
-        "elektr",
-        "svet",
-        "svetlar",
-        "chiroq",
-        "far",
-        "fara",
-        "signal",
-        "predoxranitel",
-        "predoxranitel",
-        "fuse"
-    ]):
-
-        return """
-<b>💡 ELEKTR TIZIMI</b>
-
-Elektr jihoz ishlamasa:
-
-• Predoxranitelni tekshirish mumkin.
-• Klemma va ulanishlarni ko‘rish kerak.
-• Lampochka kuygan bo‘lishi mumkin.
-• Bir nechta qurilma birdan ishlamasa, asosiy elektr ta’minoti yoki sug‘urta tizimida muammo bo‘lishi mumkin.
-
-⚠️ Simlarni tasodifiy ulab ko‘rmang — qisqa tutashuv xavfi bor.
-"""
-
-
-    # -----------------------------------------------------
-    # ANTIFRIZ
-    # -----------------------------------------------------
-
-    if any(word in t for word in [
-        "antifriz",
-        "antifreez",
-        "sovutish suyuqligi"
-    ]):
-
-        return """
-<b>💧 ANTIFRIZ</b>
-
-Antifriz kamaygan bo‘lsa, faqat to‘ldirish bilan cheklanmasdan sizib chiqish sababini ham aniqlash kerak.
-
-⚠️ Qizigan dvigatelda radiator qopqog‘ini ochmang.
-
-Agar suyuqlik tez kamayib ketsa yoki mashina qizisa, ustaga murojaat qiling.
-"""
-
-
-    # -----------------------------------------------------
-    # KALIT / SIGNALIZATSIYA
-    # -----------------------------------------------------
-
-    if any(word in t for word in [
-        "kalit",
-        "signalizatsiya",
-        "pult",
-        "eshik ochilmay",
-        "qulf"
-    ]):
-
-        return """
-<b>🔐 KALIT / SIGNALIZATSIYA</b>
-
-Agar pult ishlamayotgan bo‘lsa:
-
-🔋 Pult batareyasi tugagan bo‘lishi mumkin.
-🚗 Mashina akkumulyatorini tekshirish kerak.
-🔑 Zaxira kalit bo‘lsa, undan foydalanib ko‘ring.
-
-Immobilayzer belgisi chiqsa, kalitni tanimaslik bilan bog‘liq muammo bo‘lishi mumkin.
-"""
-
-
-    # -----------------------------------------------------
-    # COBALT
-    # -----------------------------------------------------
-
-    if "cobalt" in t:
-
-        return """
-<b>🚗 CHEVROLET COBALT</b>
-
-Cobalt bo‘yicha yordam beraman.
-
-Muammoni aniqroq yozing:
-
-🛞 Cobalt baloni teshildi
-🔋 Cobalt akkumulyatori o‘tirib qoldi
-🚗 Cobalt o‘t olmayapti
-🌡 Cobalt qizib ketyapti
-🚨 Cobalt panelida Check yondi
-🛑 Cobalt tormozi qattiq bo‘lib qoldi
-
-Muammoni qancha batafsil yozsangiz, shuncha aniqroq maslahat beraman.
-"""
-
-
-    # -----------------------------------------------------
-    # NEXIA
-    # -----------------------------------------------------
-
-    if "nexia" in t:
-
-        return """
-<b>🚗 NEXIA</b>
-
-Nexia bo‘yicha ham yordam beraman.
-
-Muammoni yozing:
-
-• o‘t olmayapti
-• qizib ketyapti
-• starter ishlamayapti
-• balon teshildi
-• akkumulyator o‘tirib qoldi
-• Check Engine yondi
-"""
-
-
-    # -----------------------------------------------------
-    # GENTRA / LACETTI
-    # -----------------------------------------------------
-
-    if any(word in t for word in [
-        "gentra",
-        "lacetti",
-        "lasetti"
-    ]):
-
-        return """
-<b>🚗 AVTOMOBIL MUAMMOSI</b>
-
-Bu avtomobil bo‘yicha ham yordam beraman.
-
-Muammoni belgisi bilan yozing.
-
-Masalan:
-
-<i>Gentra starter aylanadi, lekin motor o‘t olmayapti.</i>
-
-yoki:
-
-<i>Lacetti qizib ketyapti.</i>
-"""
-
-
-    # -----------------------------------------------------
-    # UMUMIY YORDAM
-    # -----------------------------------------------------
-
-    if any(word in t for word in [
-        "yordam",
-        "nima qilay",
-        "nima qilaman"
-    ]):
-
-        return """
-<b>🔧 UstaDrive yordam beradi</b>
-
-Muammoni avtomobil rusumi bilan yozing.
-
-Masalan:
-
-🚗 Cobalt — o‘t olmayapti
-🛞 Cobalt — baloni teshildi
-🔋 Nexia — akkumulyator o‘tirib qoldi
-🌡 Gentra — qizib ketyapti
-🚨 Lacetti — Check Engine yondi
-"""
-
-
-    # -----------------------------------------------------
-    # TOPILMAGAN MUAMMO
-    # -----------------------------------------------------
-
-    return """
-<b>🤔 Muammoni to‘liq tushunmadim.</b>
-
-Avtomobil rusumi + muammoni yozib ko‘ring.
-
-Masalan:
-
-<i>Cobalt baloni teshilib qoldi nima qilay?</i>
-
-yoki:
-
-<i>Nexia 3 starter aylanyapti lekin motor o't olmayapti.</i>
-
-🔧 Muammoni qancha batafsil yozsangiz, shuncha yaxshi tahlil qilaman.
+Iltimos, rasmni qayta yuboring yoki muammoni matn bilan yozing.
 """
 
 
@@ -606,44 +439,48 @@ yoki:
 @bot.message_handler(commands=["start"])
 def start(message):
 
+    save_user(
+        message.from_user
+    )
+
     if not require_subscription(message):
         return
-
-    name = message.from_user.first_name or "do‘st"
 
     bot.send_message(
         message.chat.id,
         f"""
-<b>🚗 UstaDrive</b>
+<b>🚗 {BOT_NAME}ga xush kelibsiz!</b>
 
-Assalomu alaykum, <b>{name}</b>! 👋
+Men sizga avtomobil muammolarini tushunishda yordam beradigan <b>AI Usta</b>man. 🤖🔧
 
-Men avtomobil muammolarini tushuntirishga yordam beraman. 🔧
+Menga oddiy qilib yozing:
 
-<b>Tugma bosishingiz shart emas.</b>
+<i>“Cobalt ertalab zo‘rg‘a o‘t olyapti”</i>
 
-Muammoni oddiy qilib yozing.
+<i>“Nexia qizib ketyapti”</i>
 
-Masalan:
+<i>“Panelda sariq belgi chiqdi”</i>
 
-<i>“Cobalt baloni teshilib qoldi, nima qilay?”</i>
+<i>“Balonim teshildi”</i>
 
-Men imkon qadar bosqichma-bosqich yordam beraman.
+📸 Panel yoki detal rasmini ham yuborishingiz mumkin.
 """,
         reply_markup=main_menu()
     )
 
 
 # =========================================================
-# OBUNA TEKSHIRISH TUGMASI
+# OBUNA CALLBACK
 # =========================================================
 
 @bot.callback_query_handler(
-    func=lambda call: call.data == "check_subscription"
+    func=lambda call: call.data == "check_sub"
 )
-def check_subscription_callback(call):
+def check_sub(call):
 
-    if is_subscribed(call.from_user.id):
+    if is_subscribed(
+        call.from_user.id
+    ):
 
         bot.answer_callback_query(
             call.id,
@@ -653,11 +490,11 @@ def check_subscription_callback(call):
         bot.send_message(
             call.message.chat.id,
             """
-<b>✅ Obuna tasdiqlandi!</b>
+<b>✅ Tayyor!</b>
 
-UstaDrive'dan foydalanishingiz mumkin. 🚗🔧
+Endi UstaDrive'dan foydalanishingiz mumkin. 🚗🔧
 
-Avtomobil muammosini yozing.
+Muammoni yozing yoki rasm yuboring.
 """,
             reply_markup=main_menu()
         )
@@ -666,38 +503,88 @@ Avtomobil muammosini yozing.
 
         bot.answer_callback_query(
             call.id,
-            "❌ Hali ikkala kanalga ham qo‘shilmagansiz.",
+            "❌ Ikkala kanalga ham qo‘shiling.",
             show_alert=True
         )
 
 
 # =========================================================
-# MATNLI XABAR
+# ADMIN
 # =========================================================
 
-@bot.message_handler(content_types=["text"])
+def is_admin(user_id):
+
+    return (
+        ADMIN_ID
+        and str(user_id) == str(ADMIN_ID)
+    )
+
+
+@bot.message_handler(commands=["admin"])
+def admin(message):
+
+    if not is_admin(
+        message.from_user.id
+    ):
+
+        bot.send_message(
+            message.chat.id,
+            "⛔ Bu bo‘lim faqat admin uchun."
+        )
+
+        return
+
+    users, messages = get_stats()
+
+    bot.send_message(
+        message.chat.id,
+        f"""
+<b>👨‍🔧 USTADRIVE ADMIN</b>
+
+👥 Foydalanuvchilar: <b>{users}</b>
+💬 Xabarlar: <b>{messages}</b>
+
+🤖 AI: <b>faol</b>
+📢 Majburiy obuna: <b>2 kanal</b>
+"""
+    )
+
+
+# =========================================================
+# TEXT
+# =========================================================
+
+@bot.message_handler(
+    content_types=["text"]
+)
 def text_handler(message):
+
+    save_user(
+        message.from_user
+    )
 
     if not require_subscription(message):
         return
 
     text = message.text.strip()
 
-    # MENU TUGMALARI
-    if text == "🔧 Avto yordam":
+    if text == "🤖 AI Usta":
 
         bot.send_message(
             message.chat.id,
             """
-<b>🔧 Avto yordam</b>
+<b>🤖 AI Usta</b>
 
-Avtomobil muammosini oddiy qilib yozing.
+Avtomobil muammosini oddiy gap bilan yozing.
 
 Masalan:
 
-<i>Cobalt baloni teshildi nima qilay?</i>
-""",
-            reply_markup=main_menu()
+<i>Cobalt baloni teshilib qoldi, nima qilay?</i>
+
+<i>Gentra qizib ketyapti.</i>
+
+<i>Nexia starteri aylanadi, lekin o't olmayapti.</i>
+"""
         )
 
         return
@@ -708,39 +595,53 @@ Masalan:
         bot.send_message(
             message.chat.id,
             """
-<b>🚨 TEZKOR YORDAM</b>
+<b>🚨 TEZ YORDAM</b>
 
-Agar mashina yo‘lda buzilgan bo‘lsa:
+Agar mashina yo'lda xavfli tarzda buzilgan bo'lsa:
 
-1️⃣ Xavfsiz joyga to‘xtang.
-2️⃣ Avariya chirog‘ini yoqing.
-3️⃣ Yo‘l harakatiga xalaqit bermang.
-4️⃣ Xavfli nosozlik bo‘lsa, haydashni davom ettirmang.
-
-Muammoni yozing — nima qilish mumkinligini tushuntiraman.
-""",
-            reply_markup=main_menu()
+1. Xavfsiz joyga to'xtang.
+2. Avariya chirog'ini yoqing.
+3. Yo'l harakatiga xalaqit bermang.
+4. Xavfli nosozlik bo'lsa, mashinani haydamang.
+5. Zarur bo'lsa, malakali usta yoki yo'l yordamiga murojaat qiling.
+"""
         )
 
         return
 
 
-    if text == "📚 Maslahatlar":
+    if text == "📚 Avto maslahat":
 
         bot.send_message(
             message.chat.id,
             """
 <b>📚 AVTO MASLAHATLAR</b>
 
-🛢 Dvigatel moyini tekshirish
-💧 Antifriz darajasini nazorat qilish
-🔋 Akkumulyator holatini tekshirish
+🛢 Moyni nazorat qilish
+💧 Antifrizni tekshirish
+🔋 Akkumulyatorni tekshirish
 🛞 Shina bosimini nazorat qilish
-🛑 Tormoz tizimini vaqtida tekshirtirish
-🚨 Paneldagi ogohlantirishlarni e'tiborsiz qoldirmaslik
-🔧 G‘alati tovushlarni vaqtida tekshirtirish
-""",
-            reply_markup=main_menu()
+🛑 Tormozlarni vaqtida tekshirtirish
+🚨 Panel belgilarini e'tiborsiz qoldirmaslik
+🔧 G'alati tovushlarni vaqtida tekshirtirish
+"""
+        )
+
+        return
+
+
+    if text == "📊 Statistika":
+
+        users, messages = get_stats()
+
+        bot.send_message(
+            message.chat.id,
+            f"""
+<b>📊 UstaDrive</b>
+
+👥 Foydalanuvchilar: <b>{users}</b>
+💬 Jami xabarlar: <b>{messages}</b>
+"""
         )
 
         return
@@ -751,27 +652,40 @@ Muammoni yozing — nima qilish mumkinligini tushuntiraman.
         bot.send_message(
             message.chat.id,
             """
-<b>ℹ️ UstaDrive</b>
+<b>ℹ️ QANDAY FOYDALANISH</b>
 
-Tugmalar bilan yoki oddiy yozib foydalanishingiz mumkin.
+Tugma bosish shart emas.
 
-Masalan:
+Shunchaki yozing:
 
 🚗 Cobalt o‘t olmayapti
 🛞 Balon teshildi
 🔋 Akkumulyator o‘tirib qoldi
 🌡 Motor qizib ketdi
 🚨 Check Engine yondi
-🛑 Tormoz ishlamayapti
-""",
-            reply_markup=main_menu()
+🛑 Tormoz yumshab qoldi
+
+📸 Rasm yuborsangiz, AI uni ham tahlil qilishga harakat qiladi.
+"""
         )
 
         return
 
 
-    # ODDIY SAVOL
-    answer = car_advice(text)
+    # Oddiy savol -> AI
+
+    add_message(
+        message.from_user.id
+    )
+
+    bot.send_chat_action(
+        message.chat.id,
+        "typing"
+    )
+
+    answer = ask_ai(
+        text
+    )
 
     bot.send_message(
         message.chat.id,
@@ -781,11 +695,79 @@ Masalan:
 
 
 # =========================================================
-# RASM
+# PHOTO
 # =========================================================
 
-@bot.message_handler(content_types=["photo"])
+@bot.message_handler(
+    content_types=["photo"]
+)
 def photo_handler(message):
+
+    save_user(
+        message.from_user
+    )
+
+    if not require_subscription(message):
+        return
+
+    bot.send_chat_action(
+        message.chat.id,
+        "typing"
+    )
+
+    try:
+
+        photo = message.photo[-1]
+
+        file_info = bot.get_file(
+            photo.file_id
+        )
+
+        image_bytes = bot.download_file(
+            file_info.file_path
+        )
+
+        caption = (
+            message.caption
+            or
+            "Rasmdagi avtomobil muammosini tahlil qil."
+        )
+
+        add_message(
+            message.from_user.id
+        )
+
+        answer = ask_ai_image(
+            image_bytes,
+            caption
+        )
+
+        bot.send_message(
+            message.chat.id,
+            answer,
+            reply_markup=main_menu()
+        )
+
+    except Exception:
+
+        logging.exception(
+            "Photo handler xatosi"
+        )
+
+        bot.send_message(
+            message.chat.id,
+            "❌ Rasmni qayta ishlashda xatolik yuz berdi."
+        )
+
+
+# =========================================================
+# UNKNOWN COMMAND
+# =========================================================
+
+@bot.message_handler(
+    commands=["help"]
+)
+def help_command(message):
 
     if not require_subscription(message):
         return
@@ -793,70 +775,35 @@ def photo_handler(message):
     bot.send_message(
         message.chat.id,
         """
-<b>📸 Rasm qabul qilindi.</b>
+<b>🆘 UstaDrive yordam</b>
 
-Rasmni ko‘rdim, lekin hozirgi versiyada avtomatik AI rasm diagnostikasi ulanmagan.
+Avtomobil muammosini oddiy qilib yozing yoki rasm yuboring.
 
-Rasm bilan birga muammoni yozing:
+Masalan:
 
-<i>“Panelda shu belgi chiqdi, bu nima?”</i>
-
-Keyingi versiyada rasmni avtomatik tahlil qilish modulini ham ulashimiz mumkin.
-""",
-        reply_markup=main_menu()
-    )
-
-
-# =========================================================
-# ADMIN
-# =========================================================
-
-@bot.message_handler(commands=["admin"])
-def admin(message):
-
-    if not ADMIN_ID:
-        bot.send_message(
-            message.chat.id,
-            "⚠️ ADMIN_ID sozlanmagan."
-        )
-        return
-
-    if str(message.from_user.id) != str(ADMIN_ID):
-
-        bot.send_message(
-            message.chat.id,
-            "⛔ Siz admin emassiz."
-        )
-
-        return
-
-    bot.send_message(
-        message.chat.id,
-        """
-<b>👨‍🔧 UstaDrive ADMIN PANEL</b>
-
-✅ Bot ishlayapti.
-
-Keyingi kengaytirishlar:
-
-📊 Statistika
-👥 Foydalanuvchilar
-📢 Reklama yuborish
-➕ Yangi maslahat qo‘shish
-🚗 Yangi avtomobil qo‘shish
-🛠 Diagnostika bazasi
+“Cobalt qizib ketyapti”
+“Panelda qizil belgi chiqdi”
+“Balon teshildi”
+“Starter ishlamayapti”
 """
     )
 
 
 # =========================================================
-# BOTNI ISHGA TUSHIRISH
+# ISHGA TUSHIRISH
 # =========================================================
 
-print("🚗 UstaDrive ishga tushdi...")
+print("================================")
+print("🚗 UstaDrive ishga tushmoqda...")
+print("🤖 AI tizimi: tayyor")
+print("📢 Kanal tekshiruvi: tayyor")
+print("📸 Rasm tahlili: tayyor")
+print("📊 Statistika: tayyor")
+print("================================")
+
 
 bot.infinity_polling(
     skip_pending=True,
     timeout=60,
     long_polling_timeout=60
-    )
+)
